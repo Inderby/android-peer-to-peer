@@ -1,10 +1,12 @@
 package com.example.claude
 // MainActivity.kt
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.Settings
 import android.util.Log
 import android.view.View
 import android.widget.AdapterView
@@ -40,6 +42,7 @@ class MainActivity : AppCompatActivity() {
     private var videoCapturer: CameraVideoCapturer? = null
 
     private var targetUserId: String? = null
+    private var myId: String? = null
     private var isInCall = false
     private var isNegotiating = false
     private val socketHandler = SocketHandler.getInstance()
@@ -77,7 +80,7 @@ class MainActivity : AppCompatActivity() {
             Log.e("WebRTC", "EGL context is null")
             return
         }
-
+        myId = getDeviceUuid()
 //        Logging.enableLogToDebugOutput(Logging.Severity.LS_VERBOSE);
 
         if(!checkPermissions()){
@@ -89,12 +92,20 @@ class MainActivity : AppCompatActivity() {
 
     }
 
+    @SuppressLint("HardwareIds")
+    private fun getDeviceUuid(): String? {
+        return Settings.Secure.getString(
+            applicationContext.contentResolver,
+            Settings.Secure.ANDROID_ID
+        )
+    }
+
 
 
     private fun isPeerConnectionFactoryInitialized(): Boolean {
-        return peerConnectionFactory != null &&
-                localAudioTrack != null &&
-                localVideoTrack != null
+        return this::peerConnectionFactory.isInitialized &&
+                this::localAudioTrack.isInitialized &&
+                this::localVideoTrack.isInitialized
     }
 
 
@@ -181,16 +192,17 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun createAndInitializePeerConnection() {
-        if (peerConnectionFactory == null) {
-            Log.e("WebRTC", "PeerConnectionFactory is null")
-            return
+        if (!isPeerConnectionFactoryInitialized()) {
+            Log.e("WebRTC", "PeerConnectionFactory is not initialized")
+            initializeWebRTC()
         }
 
-        createPeerConnection()
+        if (peerConnection == null) {
+            createPeerConnection()
+        }
 
         if (peerConnection == null) {
             Log.e("WebRTC", "Failed to create PeerConnection")
-            showToast("WebRTC 초기화에 실패했습니다")
             return
         }
     }
@@ -290,8 +302,17 @@ class MainActivity : AppCompatActivity() {
 
     private fun startCall(targetUserId: String) {
         isInitiator = true
-        socketHandler.sendCallRequest(targetUserId)
-        updateUIState(CallState.CALLING)
+        createAndInitializePeerConnection() // PeerConnection 먼저 생성
+        Handler(Looper.getMainLooper()).postDelayed({
+            if (peerConnection != null && isPeerConnectionCreated) {
+                socketHandler.sendCallRequest(targetUserId)
+                updateUIState(CallState.CALLING)
+            } else {
+                Log.e("WebRTC", "Failed to initialize peer connection")
+                showToast("연결 설정에 실패했습니다")
+                cleanupAndEndCall()
+            }
+        }, 1000) // 1초 지연으로 초기화 완료 보장
     }
 
     private fun handleOffer(callerId: String, offerSdp: String) {
@@ -409,8 +430,14 @@ class MainActivity : AppCompatActivity() {
         Log.d("WebRTC", "Attempting to create and send offer. isNegotiating: $isNegotiating")
         if (peerConnection == null) {
             Log.e("WebRTC", "PeerConnection is null when trying to create offer")
-            isNegotiating = false
-            return
+            createAndInitializePeerConnection() // PeerConnection 재생성 시도
+
+            if (peerConnection == null) {
+                Log.e("WebRTC", "Failed to create PeerConnection after retry")
+                isNegotiating = false
+                showToast("연결 설정에 실패했습니다")
+                return
+            }
         }
         synchronized(this) {
             if (isNegotiating) {
@@ -783,16 +810,16 @@ class MainActivity : AppCompatActivity() {
                 PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
                 PeerConnection.IceServer.builder("stun:stun.l.google.com:5349").createIceServer(),
                 PeerConnection.IceServer.builder("stun:stun1.l.google.com:3478").createIceServer(),
-//                PeerConnection.IceServer.builder("stun:stun1.l.google.com:5349").createIceServer(),
-//                PeerConnection.IceServer.builder("stun:stun2.l.google.com:19302").createIceServer(),
-//                PeerConnection.IceServer.builder("stun:stun2.l.google.com:5349").createIceServer(),
-//                PeerConnection.IceServer.builder("stun:stun3.l.google.com:3478").createIceServer(),
-//                PeerConnection.IceServer.builder("stun:stun3.l.google.com:5349").createIceServer(),
-//                PeerConnection.IceServer.builder("stun:stun4.l.google.com:19302").createIceServer(),
-//                PeerConnection.IceServer.builder("stun:stun4.l.google.com:5349").createIceServer(),
-                PeerConnection.IceServer.builder("turn:10.0.2.2:3478")
+                PeerConnection.IceServer.builder("stun:stun1.l.google.com:5349").createIceServer(),
+                PeerConnection.IceServer.builder("stun:stun2.l.google.com:19302").createIceServer(),
+                PeerConnection.IceServer.builder("stun:stun2.l.google.com:5349").createIceServer(),
+                PeerConnection.IceServer.builder("stun:stun3.l.google.com:3478").createIceServer(),
+                PeerConnection.IceServer.builder("stun:stun3.l.google.com:5349").createIceServer(),
+                PeerConnection.IceServer.builder("stun:stun4.l.google.com:19302").createIceServer(),
+                PeerConnection.IceServer.builder("stun:stun4.l.google.com:5349").createIceServer(),
+                PeerConnection.IceServer.builder("")
                     .setUsername("test")
-                    .setPassword("test")
+                    .setPassword("")
                     .createIceServer()
             )
         ).apply {
@@ -1026,15 +1053,16 @@ class MainActivity : AppCompatActivity() {
         }
 
 
+
 //        val localStream = peerConnectionFactory.createLocalMediaStream("local-stream")
         peerConnection?.addTransceiver(
             MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO,
-            RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.SEND_RECV)
+            RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.SEND_RECV,listOf(myId))
         )
 
         peerConnection?.addTransceiver(
             MediaStreamTrack.MediaType.MEDIA_TYPE_AUDIO,
-            RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.SEND_RECV)
+            RtpTransceiver.RtpTransceiverInit(RtpTransceiver.RtpTransceiverDirection.SEND_RECV, listOf(myId))
         )
 
         localVideoTrack?.let { videoTrack ->
@@ -1053,38 +1081,41 @@ class MainActivity : AppCompatActivity() {
         val lines = sdpDescription.split("\r\n").toMutableList()
         var mediaSection = false
         var videoSection = false
+        val modifiedLines = mutableListOf<String>()
 
-        for (i in lines.indices) {
-            val line = lines[i]
-
-            if (line.startsWith("m=")) {
-                mediaSection = true
-                videoSection = line.startsWith("m=video")
-            }
-
-            // 미디어 섹션에서 sendrecv 속성 보장
-            if (mediaSection && (line.startsWith("a=sendonly") ||
+        for (line in lines) {
+            when {
+                line.startsWith("m=") -> {
+                    mediaSection = true
+                    videoSection = line.startsWith("m=video")
+                    modifiedLines.add(line)
+                    // 미디어 섹션 시작시 sendrecv 명시적 추가
+                    modifiedLines.add("a=sendrecv")
+                }
+                // 기존의 미디어 방향 속성 제거
+                line.startsWith("a=sendonly") ||
                         line.startsWith("a=recvonly") ||
-                        line.startsWith("a=inactive"))) {
-                lines[i] = "a=sendrecv"
+                        line.startsWith("a=inactive") ||
+                        line.startsWith("a=sendrecv") -> {
+                    // 건너뛰기 (새로운 sendrecv로 대체)
+                }
+                else -> {
+                    modifiedLines.add(line)
+                }
             }
 
-            // 비디오 섹션에서 필요한 코덱과 피드백 메커니즘 보장
+            // 비디오 섹션에 필요한 피드백 메커니즘 추가
             if (videoSection && line.startsWith("a=rtpmap")) {
-                if (!lines.any { it.contains("a=rtcp-fb:* ccm fir") }) {
-                    lines.add(i + 1, "a=rtcp-fb:* ccm fir")
-                }
-                if (!lines.any { it.contains("a=rtcp-fb:* nack") }) {
-                    lines.add(i + 1, "a=rtcp-fb:* nack")
-                }
-                if (!lines.any { it.contains("a=rtcp-fb:* nack pli") }) {
-                    lines.add(i + 1, "a=rtcp-fb:* nack pli")
-                }
+                modifiedLines.add("a=rtcp-fb:* ccm fir")
+                modifiedLines.add("a=rtcp-fb:* nack")
+                modifiedLines.add("a=rtcp-fb:* nack pli")
+                modifiedLines.add("a=rtcp-fb:* goog-remb")
             }
         }
 
-        return lines.joinToString("\r\n")
+        return modifiedLines.joinToString("\r\n")
     }
+
 
     private fun cleanupAndEndCall() {
         try {
