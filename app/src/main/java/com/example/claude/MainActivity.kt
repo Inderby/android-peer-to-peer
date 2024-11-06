@@ -21,6 +21,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.webrtc.*
 import java.util.*
+import java.util.concurrent.atomic.AtomicBoolean
 
 class MainActivity : AppCompatActivity() {
     private lateinit var peerConnectionFactory: PeerConnectionFactory
@@ -30,7 +31,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var callButton: Button
     private lateinit var endCallButton: Button
     private lateinit var eglBase: EglBase
-
+    private var isEndingCall = AtomicBoolean(false)  // 통화 종료 진행 중인지 확인하는 플래그
     private lateinit var localVideoTrack: VideoTrack
     private lateinit var localAudioTrack: AudioTrack
     private var remoteVideoTrack: VideoTrack? = null  // 추가
@@ -301,7 +302,7 @@ class MainActivity : AppCompatActivity() {
         }
         if (peerConnection == null) {
             Log.e("WebRTC", "PeerConnection is null when handling offer")
-            return
+            createPeerConnection()
         }
 
         if (isNegotiating || peerConnection?.signalingState() == PeerConnection.SignalingState.HAVE_LOCAL_OFFER) {
@@ -428,13 +429,16 @@ class MainActivity : AppCompatActivity() {
             peerConnection?.createOffer(object : SdpObserver {
                 override fun onCreateSuccess(sessionDescription: SessionDescription) {
                     Log.d("WebRTC", "Offer created successfully")
+                    var sdpDescription = sessionDescription.description
+                    sdpDescription = modifySdp(sdpDescription)
 
+                    val modifiedSdp = SessionDescription(sessionDescription.type, sdpDescription)
                     // Local Description 설정
                     peerConnection?.setLocalDescription(object : SdpObserver {
                         override fun onSetSuccess() {
                             Log.d("WebRTC", "Local description set successfully")
                             targetUserId?.let { userId ->
-                                socketHandler.sendOffer(userId, sessionDescription.description)
+                                socketHandler.sendOffer(userId, modifiedSdp.description)
                                 Log.d("WebRTC", "Offer sent to $userId")
                             }
                         }
@@ -446,7 +450,7 @@ class MainActivity : AppCompatActivity() {
 
                         override fun onCreateSuccess(p0: SessionDescription?) {}
                         override fun onCreateFailure(p0: String?) {}
-                    }, sessionDescription)
+                    }, modifiedSdp)
                 }
 
                 override fun onCreateFailure(error: String?) {
@@ -503,59 +507,118 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun endCall() {
-        isInitiator = false
-        isNegotiating = false  // 초기화
-        targetUserId?.let { userId ->
-            socketHandler.sendEndCall(userId)
+        // 이미 종료 중이면 무시
+        if (!isEndingCall.compareAndSet(false, true)) {
+            Log.d("WebRTC", "Call ending already in progress")
+            return
         }
 
-        peerConnection?.close()
-        peerConnection = null
+        try {
+            Log.d("WebRTC", "Starting call end process")
 
-        updateUIState(CallState.IDLE)
+            if (!isInCall) {
+                Log.d("WebRTC", "Call is not active, skipping end call process")
+                return
+            }
+
+            // 상대방에게 통화 종료 알림은 한 번만 보냄
+            targetUserId?.let { userId ->
+                socketHandler.sendEndCall(userId)
+                Log.d("WebRTC", "End call signal sent to: $userId")
+            }
+
+            runOnUiThread {
+                cleanupResources()
+            }
+        } catch (e: Exception) {
+            Log.e("WebRTC", "Error during end call", e)
+        } finally {
+            isEndingCall.set(false)  // 플래그 초기화
+        }
+    }
+
+    private fun cleanupResources() {
+        try {
+            isInCall = false
+            isNegotiating = false
+
+            // Video/Audio 트랙 정리
+            remoteVideoTrack?.removeSink(remoteVideoView)
+            remoteVideoTrack = null
+            remoteAudioTrack = null
+
+            // PeerConnection 정리
+            peerConnection?.dispose()
+            peerConnection = null
+
+            // UI 상태 업데이트
+            updateUIState(CallState.IDLE)
+
+            Log.d("WebRTC", "Resources cleaned up successfully")
+        } catch (e: Exception) {
+            Log.e("WebRTC", "Error cleaning up resources", e)
+        }
     }
 
     private fun updateUIState(newState: CallState) {
-        state = newState  // 상태 업데이트 추가
-        when (newState) {
-            CallState.IDLE -> {
-                statusText.text = "대기 중"
-                callButton.visibility = View.VISIBLE
-                callButton.text = "통화"  // 버튼 텍스트 초기화 추가
-                endCallButton.visibility = View.GONE
-                isInCall = false
-            }
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            runOnUiThread { updateUIState(newState) }
+            return
+        }
 
-            CallState.CALLING -> {
-                statusText.text = "발신 중..."
-                callButton.visibility = View.GONE
-                endCallButton.visibility = View.VISIBLE
-                isInCall = true
+        try {
+            state = newState
+            when (newState) {
+                CallState.IDLE -> {
+                    statusText.text = "대기 중"
+                    callButton.visibility = View.VISIBLE
+                    callButton.text = "통화"
+                    endCallButton.visibility = View.GONE
+                    userListSpinner.isEnabled = true
+                    isInCall = false
+                }
+                CallState.CALLING -> {
+                    statusText.text = "발신 중..."
+                    callButton.visibility = View.GONE
+                    endCallButton.visibility = View.VISIBLE
+                    userListSpinner.isEnabled = false
+                    isInCall = true
+                }
+                CallState.RECEIVING_CALL -> {
+                    statusText.text = "수신 중..."
+                    callButton.visibility = View.VISIBLE
+                    callButton.text = "수락"
+                    endCallButton.visibility = View.VISIBLE
+                    userListSpinner.isEnabled = false
+                    isInCall = false
+                }
+                CallState.CONNECTING -> {
+                    statusText.text = "연결 중..."
+                    callButton.visibility = View.GONE
+                    endCallButton.visibility = View.VISIBLE
+                    userListSpinner.isEnabled = false
+                }
+                CallState.IN_CALL -> {
+                    statusText.text = "통화 중"
+                    callButton.visibility = View.GONE
+                    endCallButton.visibility = View.VISIBLE
+                    userListSpinner.isEnabled = false
+                    isInCall = true
+                }
             }
-
-            CallState.RECEIVING_CALL -> {
-                statusText.text = "수신 중..."
-                callButton.visibility = View.VISIBLE
-                callButton.text = "수락"
-                endCallButton.visibility = View.VISIBLE
-                isInCall = false
-            }
-
-            CallState.IN_CALL -> {
-                statusText.text = "통화 중"
-                callButton.visibility = View.GONE
-                endCallButton.visibility = View.VISIBLE
-                isInCall = true
-            }
+        } catch (e: Exception) {
+            Log.e("WebRTC", "Error updating UI state", e)
         }
     }
+
+
 
     private fun showToast(message: String) {
         Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
     }
 
     enum class CallState {
-        IDLE, CALLING, RECEIVING_CALL, IN_CALL
+        IDLE, CALLING, RECEIVING_CALL, CONNECTING, IN_CALL
     }
 
     override fun onDestroy() {
@@ -720,14 +783,14 @@ class MainActivity : AppCompatActivity() {
                 PeerConnection.IceServer.builder("stun:stun.l.google.com:19302").createIceServer(),
                 PeerConnection.IceServer.builder("stun:stun.l.google.com:5349").createIceServer(),
                 PeerConnection.IceServer.builder("stun:stun1.l.google.com:3478").createIceServer(),
-                PeerConnection.IceServer.builder("stun:stun1.l.google.com:5349").createIceServer(),
-                PeerConnection.IceServer.builder("stun:stun2.l.google.com:19302").createIceServer(),
-                PeerConnection.IceServer.builder("stun:stun2.l.google.com:5349").createIceServer(),
-                PeerConnection.IceServer.builder("stun:stun3.l.google.com:3478").createIceServer(),
-                PeerConnection.IceServer.builder("stun:stun3.l.google.com:5349").createIceServer(),
-                PeerConnection.IceServer.builder("stun:stun4.l.google.com:19302").createIceServer(),
-                PeerConnection.IceServer.builder("stun:stun4.l.google.com:5349").createIceServer(),
-                PeerConnection.IceServer.builder("turn:192.168.0.100:3478")
+//                PeerConnection.IceServer.builder("stun:stun1.l.google.com:5349").createIceServer(),
+//                PeerConnection.IceServer.builder("stun:stun2.l.google.com:19302").createIceServer(),
+//                PeerConnection.IceServer.builder("stun:stun2.l.google.com:5349").createIceServer(),
+//                PeerConnection.IceServer.builder("stun:stun3.l.google.com:3478").createIceServer(),
+//                PeerConnection.IceServer.builder("stun:stun3.l.google.com:5349").createIceServer(),
+//                PeerConnection.IceServer.builder("stun:stun4.l.google.com:19302").createIceServer(),
+//                PeerConnection.IceServer.builder("stun:stun4.l.google.com:5349").createIceServer(),
+                PeerConnection.IceServer.builder("turn:10.0.2.2:3478")
                     .setUsername("test")
                     .setPassword("test")
                     .createIceServer()
@@ -767,13 +830,20 @@ class MainActivity : AppCompatActivity() {
                 when (track) {
                     is VideoTrack -> {
                         Log.d("WebRTC", "Video track received")
-                        remoteVideoTrack?.removeSink(remoteVideoView)  // 기존 sink 제거
-                        remoteVideoTrack = track
+                        synchronized(this) {
+                            remoteVideoTrack?.removeSink(remoteVideoView)
+                            remoteVideoTrack = track
+                        }
                         runOnUiThread {
                             try {
                                 remoteVideoView.visibility = View.VISIBLE
-                                track.setEnabled(true)
-                                track.addSink(remoteVideoView)
+                                remoteVideoView.setZOrderMediaOverlay(false)
+                                remoteVideoView.setEnableHardwareScaler(true)
+
+                                synchronized(this) {
+                                    track.setEnabled(true)
+                                    track.addSink(remoteVideoView)
+                                }
                                 Log.d("WebRTC", "Remote video sink added successfully")
                             } catch (e: Exception) {
                                 Log.e("WebRTC", "Error adding remote video sink", e)
@@ -809,53 +879,55 @@ class MainActivity : AppCompatActivity() {
 
             override fun onSignalingChange(state: PeerConnection.SignalingState?) {
                 Log.d("WebRTC", "Signaling state changed to: $state")
-                when (state) {
-                    PeerConnection.SignalingState.STABLE -> {
-                        isNegotiating = false  // 시그널링이 안정화되면 재협상 가능
-                        Log.d("WebRTC", "Signaling state is stable, isNegotiating set to false")
+                runOnUiThread {
+                    when (state) {
+                        PeerConnection.SignalingState.STABLE -> {
+                            isNegotiating = false
+                        }
+                        PeerConnection.SignalingState.CLOSED -> {
+                            runOnUiThread {
+                                if (isInCall) {
+                                    cleanupAndEndCall()
+                                }
+                            }
+                        }
+                        else -> {}
                     }
-
-                    PeerConnection.SignalingState.CLOSED -> {
-                        isNegotiating = false
-                        endCall()
-
-                    }
-
-                    else -> {}
                 }
             }
 
             override fun onIceConnectionChange(state: PeerConnection.IceConnectionState?) {
                 Log.d("WebRTC", "ICE Connection state changed to: $state")
-                when (state) {
-                    PeerConnection.IceConnectionState.CHECKING -> {
-                        Log.d("WebRTC", "ICE Checking in progress...")
-                    }
-
-                    PeerConnection.IceConnectionState.CONNECTED -> {
-                        Log.d("WebRTC", "ICE Connection Connected")
-                        runOnUiThread {
+                runOnUiThread {
+                    when (state) {
+                        PeerConnection.IceConnectionState.CHECKING -> {
+                            Log.d("WebRTC", "ICE Checking in progress...")
+                            updateUIState(CallState.CALLING)
+                        }
+                        PeerConnection.IceConnectionState.CONNECTED -> {
+                            Log.d("WebRTC", "ICE Connection Connected")
                             updateUIState(CallState.IN_CALL)
                         }
-                    }
-
-                    PeerConnection.IceConnectionState.FAILED -> {
-                        Log.e("WebRTC", "ICE Connection Failed")
-                        runOnUiThread {
-                            // 연결 재시도 로직
-                            retryConnection()
+                        PeerConnection.IceConnectionState.FAILED -> {
+                            Log.e("WebRTC", "ICE Connection Failed")
+                            if (isInCall) {
+                                Log.e("WebRTC", "ICE Connection Failed, attempting retry")
+                                retryConnection()
+                            }
                         }
-                    }
-
-                    PeerConnection.IceConnectionState.DISCONNECTED -> {
-                        Log.w("WebRTC", "ICE Connection Disconnected")
-                        runOnUiThread {
-                            // 재연결 시도
-                            handleDisconnection()
+                        PeerConnection.IceConnectionState.DISCONNECTED -> {
+                            if (isInCall) {
+                                Log.w("WebRTC", "ICE Connection Disconnected, handling disconnection")
+                                handleDisconnection()
+                            }
                         }
+                        PeerConnection.IceConnectionState.CLOSED -> {
+                            runOnUiThread {
+                                endCall()
+                            }
+                        }
+                        else -> {}
                     }
-
-                    else -> Log.d("WebRTC", "ICE Connection state: $state")
                 }
             }
 
@@ -977,25 +1049,97 @@ class MainActivity : AppCompatActivity() {
 
 
     }
+    private fun modifySdp(sdpDescription: String): String {
+        val lines = sdpDescription.split("\r\n").toMutableList()
+        var mediaSection = false
+        var videoSection = false
+
+        for (i in lines.indices) {
+            val line = lines[i]
+
+            if (line.startsWith("m=")) {
+                mediaSection = true
+                videoSection = line.startsWith("m=video")
+            }
+
+            // 미디어 섹션에서 sendrecv 속성 보장
+            if (mediaSection && (line.startsWith("a=sendonly") ||
+                        line.startsWith("a=recvonly") ||
+                        line.startsWith("a=inactive"))) {
+                lines[i] = "a=sendrecv"
+            }
+
+            // 비디오 섹션에서 필요한 코덱과 피드백 메커니즘 보장
+            if (videoSection && line.startsWith("a=rtpmap")) {
+                if (!lines.any { it.contains("a=rtcp-fb:* ccm fir") }) {
+                    lines.add(i + 1, "a=rtcp-fb:* ccm fir")
+                }
+                if (!lines.any { it.contains("a=rtcp-fb:* nack") }) {
+                    lines.add(i + 1, "a=rtcp-fb:* nack")
+                }
+                if (!lines.any { it.contains("a=rtcp-fb:* nack pli") }) {
+                    lines.add(i + 1, "a=rtcp-fb:* nack pli")
+                }
+            }
+        }
+
+        return lines.joinToString("\r\n")
+    }
+
+    private fun cleanupAndEndCall() {
+        try {
+            isInCall = false
+            isNegotiating = false
+
+            // 리소스 정리
+            remoteVideoTrack?.removeSink(remoteVideoView)
+            remoteVideoTrack = null
+            remoteAudioTrack = null
+
+            peerConnection?.dispose()
+            peerConnection = null
+
+            runOnUiThread {
+                updateUIState(CallState.IDLE)
+            }
+        } catch (e: Exception) {
+            Log.e("WebRTC", "Error during cleanup", e)
+        }
+    }
 
     private fun retryConnection() {
-        peerConnection?.let { conn ->
-            // 기존 연결 종료
-            conn.close()
-            // 새로운 연결 시도
-            createPeerConnection()
-            createAndSendOffer()
+        try {
+            synchronized(this) {
+                if (!isInCall) return
+
+                // 기존 연결 정리
+                peerConnection?.dispose()
+                peerConnection = null
+                isNegotiating = false
+
+                // 새로운 연결 시도
+                createPeerConnection()
+                if (isInitiator) {
+                    createAndSendOffer()
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("WebRTC", "Error during connection retry", e)
+            cleanupAndEndCall()
         }
     }
 
     private fun handleDisconnection() {
-        // 일시적인 연결 끊김에 대한 처리
-        showToast("연결이 일시적으로 끊겼습니다. 재연결을 시도합니다...")
-        // n초 후 재연결 시도
-        Handler(Looper.getMainLooper()).postDelayed({
-            if (isInCall) {
-                retryConnection()
-            }
-        }, 5000) // 5초 후 재시도
+        try {
+            showToast("연결이 일시적으로 끊겼습니다. 재연결을 시도합니다...")
+            Handler(Looper.getMainLooper()).postDelayed({
+                if (isInCall) {
+                    retryConnection()
+                }
+            }, 3000)
+        } catch (e: Exception) {
+            Log.e("WebRTC", "Error during disconnection handling", e)
+            cleanupAndEndCall()
+        }
     }
 }
